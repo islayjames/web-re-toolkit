@@ -425,9 +425,25 @@ impl Hub {
             }
         }
 
+        // A worker whose thread has exited (e.g. a panic inside V8) still owns
+        // its `load` counter, and that counter never rises again because the
+        // worker processes nothing. `min_by_key` therefore PREFERS dead workers,
+        // turning a single panic into a black hole that attracts every
+        // subsequent job — each of which fails with "worker N is gone".
+        //
+        // Observed in production 2026-08-26: one V8 isolate-ordering panic
+        // degraded into 7 of 32 workers dead and ~40% of all jobs failing,
+        // with no recovery short of a process restart.
+        //
+        // Skip finished threads. If every worker is dead we still fall back to
+        // index 0 so the caller gets the existing "worker N is gone" error
+        // rather than a panic on an empty iterator.
         self.workers
             .iter()
             .enumerate()
+            .filter(|(_, worker)| {
+                worker.handle.as_ref().map_or(true, |handle| !handle.is_finished())
+            })
             .min_by_key(|(_, worker)| worker.load.load(Ordering::Relaxed))
             .map(|(index, _)| index)
             .unwrap_or(0)
