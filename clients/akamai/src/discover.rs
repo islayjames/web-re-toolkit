@@ -21,7 +21,7 @@ static CHALLENGE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static SEGMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,24}$").expect("segment pattern"));
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").expect("segment pattern"));
 
 const MARK: &str = "aeiouy13579";
 
@@ -288,6 +288,38 @@ mod tests {
     const PLAIN: &str = r#"<html><head>
 <script src="https://www.example.com/akam/11/5c9e4a7b"></script>
 </head></html>"#;
+
+    /// Real bytes captured from a Disney production worker 2026-09-16. Every
+    /// disneyworld.disney.go.com page serves this sensor path; its FIRST segment
+    /// is 27 characters.
+    ///
+    /// SEGMENT capped at 24 until this commit, so `looks_obfuscated` rejected the
+    /// path, `discover` returned no sensor, and the client raised
+    /// "names no Akamai sensor script" on every call. The dining availability
+    /// sweep ran at 100% failure for 23 hours behind that one bound.
+    const DISNEY: &str = r#"<html><head>
+<script src="https://cdn1.parksmedia.wdprapps.disney.com/media/advanced-finder-spa/v8.7.0-4775/main-J2AX4UGU.js"></script>
+<script src="/-0T4oBCNNNfKdwIJFIeqgzjlcoM/h1Yk2tpb3OJ84p/OUxrAQ/Wm/UNQBhWLG4"></script>
+</head></html>"#;
+
+    /// A long first segment must not hide the sensor.
+    ///
+    /// Asserts the URL, not merely `is_some()`: a bare presence check would pass
+    /// if discovery picked the wrong script — and the page carries a
+    /// same-name-shaped CDN bundle that a looser filter could select instead.
+    #[test]
+    fn a_segment_longer_than_the_old_cap_is_still_the_sensor() {
+        let surface = discover(DISNEY, "https://disneyworld.disney.go.com/dining/");
+
+        assert!(surface.is_protected());
+        let sensor = surface.sensor.clone().expect("no sensor discovered");
+        assert_eq!(sensor.kind, Kind::Obfuscated);
+        assert!(
+            sensor.url.ends_with("/-0T4oBCNNNfKdwIJFIeqgzjlcoM/h1Yk2tpb3OJ84p/OUxrAQ/Wm/UNQBhWLG4"),
+            "discovered the wrong script: {}",
+            sensor.url
+        );
+    }
 
     #[test]
     fn the_obfuscated_path_is_the_sensor_and_the_akam_script_is_the_pixel_client() {
