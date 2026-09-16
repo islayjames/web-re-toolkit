@@ -289,7 +289,12 @@ mod tests {
 <script src="https://www.example.com/akam/11/5c9e4a7b"></script>
 </head></html>"#;
 
-    /// Real bytes captured from a Disney production worker 2026-09-16. Every
+    /// Script `src` values taken verbatim from a Disney production capture
+    /// 2026-09-16 (HTTP 200, 31,495 bytes, 4 script tags). The surrounding HTML
+    /// is hand-assembled and carries 2 of those 4 — so this is a REAL-VALUE
+    /// fixture, not a real BODY. It cannot express ordering among the page's
+    /// actual scripts; the full body belongs under `captures/` if it ever needs
+    /// to. Every
     /// disneyworld.disney.go.com page serves this sensor path; its FIRST segment
     /// is 27 characters.
     ///
@@ -304,9 +309,22 @@ mod tests {
 
     /// A long first segment must not hide the sensor.
     ///
-    /// Asserts the URL, not merely `is_some()`: a bare presence check would pass
-    /// if discovery picked the wrong script — and the page carries a
-    /// same-name-shaped CDN bundle that a looser filter could select instead.
+    /// Asserts the URL, not merely `is_some()`, so a wrong pick fails loudly.
+    ///
+    /// LIMITATION, stated because the obvious reading of this test is wrong:
+    /// this fixture CANNOT catch a mis-selection. Its only other script is
+    /// cross-host AND ends in `.js`, so it is rejected twice over
+    /// (`looks_obfuscated`'s host check and its trailing-dot check) and no
+    /// plausible loosening of SEGMENT could ever select it. The assertion is
+    /// real; the fixture gives it nothing to bite on.
+    ///
+    /// The mis-selection hazard is real and measured. `obfuscated.first()` takes
+    /// document order with no ranking, so a same-host extensionless script listed
+    /// BEFORE the sensor is chosen instead — at this cap AND, for a short decoy,
+    /// at the previous cap of 24. The length bound never provided that precision.
+    /// Catching it needs a decoy fixture, which needs the token-shape predicate to
+    /// pass; both are deliberately out of scope here (a live outage wants the
+    /// change that can only loosen, never newly reject).
     #[test]
     fn a_segment_longer_than_the_old_cap_is_still_the_sensor() {
         let surface = discover(DISNEY, "https://disneyworld.disney.go.com/dining/");
