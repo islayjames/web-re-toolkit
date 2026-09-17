@@ -1151,8 +1151,24 @@ impl Session {
         }
 
         let Some(sensor) = self.surface.sensor.clone() else {
+            // Name the near-misses. Discovery used to reject silently, so this
+            // error could not distinguish "the page has no sensor" from "a
+            // rotation changed the sensor's shape and we no longer recognise
+            // it" — and the second one cost 23 hours of 100% failure to
+            // diagnose. Whatever cleared every gate but one is printed here.
+            let near = self
+                .surface
+                .rejected
+                .iter()
+                .map(|r| format!("{} [{}: {}]", r.url, r.gate, r.detail))
+                .collect::<Vec<_>>();
+            let detail = if near.is_empty() {
+                "no near-miss candidates on the page".to_string()
+            } else {
+                format!("{} near-miss candidate(s): {}", near.len(), near.join("; "))
+            };
             return Err(ClientError::unsupported(format!(
-                "{url} names no Akamai sensor script"
+                "{url} names no Akamai sensor script — {detail}"
             )));
         };
 
