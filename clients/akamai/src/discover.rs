@@ -20,8 +20,43 @@ static CHALLENGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(sec-cpt|_sec/cp_challenge|challenge_id|cp_challenge)"#).expect("challenge pattern")
 });
 
+/// Path segments are base64url-ish tokens. NO LENGTH BOUND: the previous
+/// `{1,24}` was an arbitrary guess about a value Akamai rotates, and when it
+/// rotated to a 27-character first segment every call failed for 23 hours.
+/// A bound picked to admit today's path would only defer the same outage.
 static SEGMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").expect("segment pattern"));
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]+$").expect("segment pattern"));
+
+/// Selectivity comes from TOKEN SHAPE, not length: an Akamai sensor path is
+/// generated, so across the whole path it mixes letter case AND carries digits.
+/// Human-authored asset paths (`/assets/js/vendor/polyfills`,
+/// `/static/bundles/application-a7f3.../runtime`) are lowercase words, with or
+/// without digits, and are rejected.
+///
+/// WHOLE-PATH, never per-segment: Maersk's real sensor has an all-lowercase
+/// `2ib` segment, so a per-segment rule would reject a known-good path.
+///
+/// This is calibrated on two real captures. An all-lowercase rotation would
+/// fail it CLOSED — which is why `Surface::rejected` exists: a near-miss is
+/// reported rather than silently dropped, so the next rotation is diagnosed in
+/// minutes instead of a day.
+fn looks_generated(segments: &[&str]) -> bool {
+    let mut upper = false;
+    let mut lower = false;
+    let mut digit = false;
+    for part in segments {
+        for ch in part.chars() {
+            if ch.is_ascii_uppercase() {
+                upper = true;
+            } else if ch.is_ascii_lowercase() {
+                lower = true;
+            } else if ch.is_ascii_digit() {
+                digit = true;
+            }
+        }
+    }
+    upper && lower && digit
+}
 
 const MARK: &str = "aeiouy13579";
 
@@ -61,9 +96,26 @@ pub struct Config {
     pub note: Option<String>,
 }
 
+/// A script that ALMOST looked like the sensor, and the gate that stopped it.
+///
+/// `looks_obfuscated` used to reject silently, so a rotation that broke
+/// discovery was indistinguishable from a page that genuinely carries no
+/// sensor — the difference between a 23-hour outage and a 20-minute one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rejected {
+    pub url: String,
+    /// Which gate rejected it: `cross-host`, `too-few-segments`, `akam-path`,
+    /// `has-extension`, `charset`, or `not-generated`.
+    pub gate: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Surface {
     pub sensor: Option<Script>,
+    /// Near-miss candidates, for diagnostics. Never used for selection.
+    #[serde(default)]
+    pub rejected: Vec<Rejected>,
     pub pixel_client: Option<Script>,
     pub pixel_post: Option<String>,
     pub baza: Option<String>,
@@ -99,10 +151,17 @@ pub fn discover(html: &str, base: &str) -> Surface {
     }
 
     let mut obfuscated = Vec::new();
+    let mut rejected = Vec::new();
 
     for found in SCRIPT_SRC.captures_iter(html) {
         let href = found.get(1).map_or("", |part| part.as_str());
-        if !looks_obfuscated(href, base) {
+        if let Err(why) = classify(href, base) {
+            // Keep only near-misses worth reading: a cross-host CDN bundle on
+            // every page is noise, a path that cleared every gate but one is the
+            // signal a rotation produces.
+            if why.gate != "cross-host" && why.gate != "too-few-segments" {
+                rejected.push(why);
+            }
             continue;
         }
 
@@ -149,6 +208,7 @@ pub fn discover(html: &str, base: &str) -> Surface {
     scripts.extend(obfuscated);
 
     Surface {
+        rejected,
         sensor,
         pixel_client,
         pixel_post,
@@ -231,38 +291,70 @@ fn bits_from(segment: &str) -> String {
     bits
 }
 
-fn looks_obfuscated(href: &str, base: &str) -> bool {
-    let path = if href.starts_with("http") {
-        match Url::parse(href) {
-            Ok(parsed) => parsed.path().to_string(),
-            Err(_) => return false,
+/// Classify a script `src` as the sensor shape, or name the gate that rejected it.
+///
+/// `Ok(())` means it qualifies. `Err(Rejected)` carries WHICH gate stopped it and
+/// why — the diagnostic the silent-bool version could not give.
+fn classify(href: &str, base: &str) -> Result<(), Rejected> {
+    let reject = |gate: &str, detail: String| {
+        Err(Rejected { url: href.to_string(), gate: gate.to_string(), detail })
+    };
+
+    // ── Same-host gate ────────────────────────────────────────────────────
+    //
+    // Handles THREE href forms. The protocol-relative one was previously
+    // unguarded: the check keyed on `starts_with("http")`, so `//evilcdn/a/b/c/d`
+    // skipped it entirely and could be selected as the sensor. Only dots in real
+    // hostnames accidentally prevented that.
+    let path = if href.starts_with("//") {
+        let rest = &href[2..];
+        let (host, tail) = match rest.find('/') {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, "/"),
+        };
+        let page_host = Url::parse(base).ok().and_then(|u| u.host_str().map(str::to_string));
+        if page_host.as_deref() != Some(host) {
+            return reject("cross-host", format!("protocol-relative //{host}"));
         }
+        tail.split('?').next().unwrap_or_default().to_string()
+    } else if href.starts_with("http") {
+        let (Ok(target), Ok(page)) = (Url::parse(href), Url::parse(base)) else {
+            return reject("cross-host", "unparseable absolute url".to_string());
+        };
+        if target.host_str() != page.host_str() {
+            return reject(
+                "cross-host",
+                format!("{} != {}", target.host_str().unwrap_or("?"), page.host_str().unwrap_or("?")),
+            );
+        }
+        target.path().to_string()
     } else {
         href.split('?').next().unwrap_or_default().to_string()
     };
 
-    if href.starts_with("http") {
-        let (Ok(target), Ok(page)) = (Url::parse(href), Url::parse(base)) else {
-            return false;
-        };
-        if target.host_str() != page.host_str() {
-            return false;
-        }
-    }
-
     let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
 
-    if segments.len() < 4 || path.contains("/akam/") {
-        return false;
+    if segments.len() < 4 {
+        return reject("too-few-segments", format!("{} < 4", segments.len()));
     }
-
+    if path.contains("/akam/") {
+        return reject("akam-path", "handled as a plain akam script".to_string());
+    }
     if let Some(last) = segments.last()
         && last.contains('.')
     {
-        return false;
+        return reject("has-extension", format!("last segment `{last}` contains a dot"));
     }
-
-    segments.iter().all(|segment| SEGMENT.is_match(segment))
+    if let Some(bad) = segments.iter().find(|part| !SEGMENT.is_match(part)) {
+        return reject("charset", format!("segment `{bad}` is not base64url"));
+    }
+    if !looks_generated(&segments) {
+        return reject(
+            "not-generated",
+            "path lacks the mixed-case + digit shape of a generated token".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn absolute(base: &str, href: &str) -> String {
@@ -309,24 +401,10 @@ mod tests {
 
     /// A long first segment must not hide the sensor.
     ///
-    /// Asserts the URL, not merely `is_some()`, so a wrong pick fails loudly.
-    ///
-    /// LIMITATION, stated because the obvious reading of this test is wrong:
-    /// this fixture CANNOT catch a mis-selection. Its only other script is
-    /// cross-host AND ends in `.js`, so it is rejected twice over
-    /// (`looks_obfuscated`'s host check and its trailing-dot check) and no
-    /// plausible loosening of SEGMENT could ever select it. The assertion is
-    /// real; the fixture gives it nothing to bite on.
-    ///
-    /// The mis-selection hazard is real and measured. `obfuscated.first()` takes
-    /// document order with no ranking, so a same-host extensionless script listed
-    /// BEFORE the sensor is chosen instead — at this cap AND, for a short decoy,
-    /// at the previous cap of 24. The length bound never provided that precision.
-    /// Catching it needs a decoy fixture, which needs the token-shape predicate to
-    /// pass; both are deliberately out of scope here (a live outage wants the
-    /// change that can only loosen, never newly reject).
+    /// The gate that failed in production: segment 1 is 27 chars, and the cap
+    /// was 24. Asserts the URL, not `is_some()`, so a wrong pick fails loudly.
     #[test]
-    fn a_segment_longer_than_the_old_cap_is_still_the_sensor() {
+    fn a_long_first_segment_does_not_hide_the_sensor() {
         let surface = discover(DISNEY, "https://disneyworld.disney.go.com/dining/");
 
         assert!(surface.is_protected());
@@ -337,6 +415,81 @@ mod tests {
             "discovered the wrong script: {}",
             sensor.url
         );
+    }
+
+    /// A rotation LONGER than any bound we might have guessed still discovers.
+    ///
+    /// This is the test the length cap could never pass: 24 failed on 27, and a
+    /// cap of 64 fails on 70. Dropping the bound is what makes it green, which
+    /// is the whole argument for replacing length with shape.
+    #[test]
+    fn a_seventy_character_segment_still_discovers() {
+        const ROTATED: &str = r#"<html><head>
+<script src="/-0T4oBCNNNfKdwIJFIeqgzjlcoM0T4oBCNNNfKdwIJFIeqgzjlcoM0T4oBCNNNfKdwIJ/h1Yk2tpb3OJ84p/OUxrAQ/Wm/UNQBhWLG4"></script>
+</head></html>"#;
+        let surface = discover(ROTATED, "https://disneyworld.disney.go.com/dining/");
+        assert!(surface.sensor.is_some(), "a longer rotation must not break discovery");
+    }
+
+    /// `obfuscated.first()` takes DOCUMENT ORDER with no ranking, so a decoy
+    /// listed before the sensor is selected instead of it.
+    ///
+    /// Both decoys here are same-host and extensionless — they clear the host
+    /// gate, the segment-count gate and the extension gate. The length cap
+    /// admitted the short one at 24 and the long one at 64, i.e. it never
+    /// provided this selectivity at any bound. Shape does.
+    #[test]
+    fn a_same_host_app_bundle_ordered_before_the_sensor_is_not_selected() {
+        const LONG_DECOY: &str = r#"<html><head>
+<script src="/static/bundles/application-a7f3c9e12b4d6f8a0c5e2b1d9f7a3c60/runtime"></script>
+<script src="/-0T4oBCNNNfKdwIJFIeqgzjlcoM/h1Yk2tpb3OJ84p/OUxrAQ/Wm/UNQBhWLG4"></script>
+</head></html>"#;
+        const SHORT_DECOY: &str = r#"<html><head>
+<script src="/assets/js/vendor/polyfills"></script>
+<script src="/-0T4oBCNNNfKdwIJFIeqgzjlcoM/h1Yk2tpb3OJ84p/OUxrAQ/Wm/UNQBhWLG4"></script>
+</head></html>"#;
+
+        for (label, html) in [("long", LONG_DECOY), ("short", SHORT_DECOY)] {
+            let surface = discover(html, "https://disneyworld.disney.go.com/dining/");
+            let sensor = surface.sensor.expect("no sensor discovered");
+            assert!(
+                sensor.url.ends_with("/UNQBhWLG4"),
+                "{label} decoy was selected instead of the sensor: {}",
+                sensor.url
+            );
+        }
+    }
+
+    /// A protocol-relative cross-host script must not be selected.
+    ///
+    /// The same-host gate keyed on `starts_with("http")`, so `//host/...` skipped
+    /// it entirely. Only dots in real hostnames accidentally prevented a
+    /// cross-host script from being chosen as the sensor.
+    #[test]
+    fn a_protocol_relative_cross_host_script_is_not_the_sensor() {
+        const CROSS: &str = r#"<html><head>
+<script src="//evilcdn/aB1/bBc2/cCd3/dDe4"></script>
+<script src="/-0T4oBCNNNfKdwIJFIeqgzjlcoM/h1Yk2tpb3OJ84p/OUxrAQ/Wm/UNQBhWLG4"></script>
+</head></html>"#;
+        let surface = discover(CROSS, "https://disneyworld.disney.go.com/dining/");
+        let sensor = surface.sensor.expect("no sensor discovered");
+        assert!(sensor.url.ends_with("/UNQBhWLG4"), "cross-host script selected: {}", sensor.url);
+    }
+
+    /// A page with no sensor reports the near-misses that ALMOST qualified.
+    ///
+    /// This is the difference between a 23-hour outage and a 20-minute one: the
+    /// error can say "one candidate cleared every gate but the charset" rather
+    /// than only "no sensor here".
+    #[test]
+    fn a_near_miss_is_recorded_for_diagnostics() {
+        const NEAR: &str = r#"<html><head>
+<script src="/aB1/bB!2/cCd3/dDe4"></script>
+</head></html>"#;
+        let surface = discover(NEAR, "https://disneyworld.disney.go.com/dining/");
+        assert!(surface.sensor.is_none());
+        assert_eq!(surface.rejected.len(), 1, "near-miss not recorded: {:?}", surface.rejected);
+        assert_eq!(surface.rejected[0].gate, "charset");
     }
 
     #[test]
