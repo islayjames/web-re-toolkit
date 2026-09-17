@@ -7,7 +7,7 @@
    "properties": {
     "appCodeName": "Mozilla",
     "appName": "Netscape",
-    "appVersion": "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "appVersion": "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     "cookieEnabled": true,
     "deviceMemory": 16,
     "doNotTrack": null,
@@ -23,7 +23,7 @@
     "platform": "MacIntel",
     "product": "Gecko",
     "productSub": "20030107",
-    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     "vendor": "Google Inc.",
     "vendorSub": "",
     "webdriver": false
@@ -130,11 +130,11 @@
    },
    {
     "brand": "Google Chrome",
-    "version": "151"
+    "version": "149"
    },
    {
     "brand": "Chromium",
-    "version": "151"
+    "version": "149"
    }
   ],
   "mobile": false,
@@ -149,16 +149,16 @@
     },
     {
      "brand": "Google Chrome",
-     "version": "151.0.7922.138"
+     "version": "149.0.0.0"
     },
     {
      "brand": "Chromium",
-     "version": "151.0.7922.138"
+     "version": "149.0.0.0"
     }
    ],
    "model": "",
    "platformVersion": "26.5.2",
-   "uaFullVersion": "151.0.7922.138",
+   "uaFullVersion": "149.0.0.0",
    "wow64": false
   }
  },
