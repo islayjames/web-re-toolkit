@@ -15,6 +15,62 @@ static INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<script\b([^>]*)>(.*?)</script\s*>"#).expect("inline script pattern")
 });
 
+
+/// Does this `<script>` tag hold JavaScript a browser would EXECUTE?
+///
+/// The page loader used to take every `<script>` it found and run the contents
+/// as a classic script, ignoring `type` entirely. A browser does not: the type
+/// attribute decides whether the element is code at all.
+///
+/// Measured against disneyworld.disney.go.com/dining/ on 2026-09-17, where FOUR
+/// of nine page scripts failed and two of those never compiled:
+///
+///   main-D4J4DZL7.js  SyntaxError: Cannot use import statement outside a module
+///   inline:4          SyntaxError: Unexpected token ':'
+///
+/// The second is an import map — JSON, handed to a JavaScript compiler. A
+/// browser reads it as data and never executes it. The first is an ES module,
+/// which is genuinely executable but needs module semantics this realm does not
+/// have yet; running it as a classic script can only throw.
+///
+/// This matters beyond tidiness because the Akamai sensor SAMPLES THE PAGE it
+/// runs in. A page where half the scripts threw is not the page a real browser
+/// presents, and the sensor reports the difference.
+///
+/// Unknown-but-JS-ish types are executed rather than skipped: failing toward
+/// running a script keeps the old behaviour for anything not positively
+/// identified as data.
+fn script_is_executable(attributes: &std::collections::BTreeMap<String, String>) -> bool {
+    let Some(kind) = attributes.get("type") else {
+        return true; // no type attribute: a classic script
+    };
+    let kind = kind.trim().to_ascii_lowercase();
+    if kind.is_empty() {
+        return true;
+    }
+    // Data blocks. A browser never executes these.
+    const DATA_TYPES: [&str; 8] = [
+        "importmap",
+        "speculationrules",
+        "application/json",
+        "application/ld+json",
+        "text/json",
+        "text/template",
+        "text/html",
+        "text/plain",
+    ];
+    if DATA_TYPES.contains(&kind.as_str()) {
+        return false;
+    }
+    // ES modules: executable in a browser, but this realm has no module
+    // support, so running one as a classic script only produces
+    // "Cannot use import statement outside a module".
+    if kind == "module" {
+        return false;
+    }
+    true
+}
+
 static FIELD_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?is)<(input|textarea|select|button)\b([^>]*)>"#).expect("field pattern"));
 
@@ -163,6 +219,9 @@ impl Page {
 
         self.script_offsets = SCRIPT_TAG
             .captures_iter(html)
+            .filter(|found| {
+                script_is_executable(&attributes(found.get(1).map_or("", |part| part.as_str())))
+            })
             .map(|found| {
                 let at = found.get(0).map_or(0, |part| part.start());
                 let attributes = attributes(found.get(1).map_or("", |part| part.as_str()));
@@ -179,7 +238,10 @@ impl Page {
 
         self.inline_scripts = INLINE_SCRIPT
             .captures_iter(html)
-            .filter(|found| !attributes(found.get(1).map_or("", |part| part.as_str())).contains_key("src"))
+            .filter(|found| {
+                let attrs = attributes(found.get(1).map_or("", |part| part.as_str()));
+                !attrs.contains_key("src") && script_is_executable(&attrs)
+            })
             .map(|found| {
                 let at = found.get(0).map_or(0, |part| part.start());
                 (at, found.get(2).map_or("", |part| part.as_str()).to_string())
