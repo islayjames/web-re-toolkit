@@ -12,8 +12,26 @@
 
 use std::path::Path;
 
-/// Every `Chrome/<major>` the JS surface claims.
+/// Every `Chrome/<major>` the JS surface claims AT RUNTIME.
+///
+/// Reads BOTH the asset and `BUNDLED_CHROME`, because the asset is not the
+/// authority: `Profile::desktop_chrome()` calls `retune_chrome(BUNDLED_CHROME)`,
+/// which rewrites every version field in the loaded JSON. An earlier version of
+/// this test read only the asset — so editing the JSON alone passed the test
+/// while the runtime still emitted the old version, and the fix shipped inert.
 fn surface_majors() -> Vec<u32> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wre-sandbox/src/profile.rs");
+    let code = std::fs::read_to_string(&src).expect("profile.rs");
+    let marker = "const BUNDLED_CHROME: &str = \"";
+    let at = code.find(marker).expect("BUNDLED_CHROME is declared");
+    let rest = &code[at + marker.len()..];
+    let retuned: u32 = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("BUNDLED_CHROME is a number");
+
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../wre-sandbox/assets/desktop-chrome.json");
     let raw = std::fs::read_to_string(&path).expect("surface asset");
@@ -26,6 +44,8 @@ fn surface_majors() -> Vec<u32> {
         }
     }
     assert!(!out.is_empty(), "no Chrome/<version> found in the surface asset");
+    // The retune value is what the page actually sees, so it must agree too.
+    out.push(retuned);
     out
 }
 
