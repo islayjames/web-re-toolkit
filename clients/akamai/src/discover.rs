@@ -403,6 +403,26 @@ mod tests {
     ///
     /// The gate that failed in production: segment 1 is 27 chars, and the cap
     /// was 24. Asserts the URL, not `is_some()`, so a wrong pick fails loudly.
+    /// LIVE capture through a Bright Data ISP proxy, 2026-09-17 05:2xZ, from the
+    /// IP that is currently failing every solve. 4,644,366 bytes, 5 script tags,
+    /// advanced-finder-spa v8.8.0-4875. The sensor path here is SHORTER than the
+    /// 27-char one captured 2026-09-16 — Akamai rotates it.
+    #[test]
+    fn the_live_proxied_capture_2026_09_17_discovers() {
+        const LIVE: &str = r#"<html><head>
+<script src="https://go4.disney.go.com"></script>
+<script src="https://cdn1.parksmedia.wdprapps.disney.com/media/advanced-finder-spa/v8.8.0-4875/polyfills-JUTM3XWE.js"></script>
+<script src="https://cdn1.parksmedia.wdprapps.disney.com/media/advanced-finder-spa/v8.8.0-4875/main-D4J4DZL7.js"></script>
+<script src="/syndicated/content/footer/?container=footerWrapper&amp;responsive=1&amp;affiliation=STD_GST&amp;locale=en_US"></script>
+<script src="/gV9ueRrKZ6U8qhYGujr5/7a1bGzXNai0cQ41Y/HUBaJAE/G2h/JHF82NAYB"></script>
+</head></html>"#;
+        let surface = discover(LIVE, "https://disneyworld.disney.go.com/dining/");
+        let sensor = surface.sensor.expect("SHIPPED CODE FINDS NO SENSOR ON THE LIVE PAGE");
+        assert!(
+            sensor.url.ends_with("/gV9ueRrKZ6U8qhYGujr5/7a1bGzXNai0cQ41Y/HUBaJAE/G2h/JHF82NAYB"),
+            "wrong script selected: {}", sensor.url);
+    }
+
     #[test]
     fn a_long_first_segment_does_not_hide_the_sensor() {
         let surface = discover(DISNEY, "https://disneyworld.disney.go.com/dining/");

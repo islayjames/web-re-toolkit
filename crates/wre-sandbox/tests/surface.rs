@@ -111,7 +111,7 @@ fn the_same_accessor_still_works_on_a_real_receiver() {
         "Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent').get.call(navigator)",
     );
 
-    assert!(outcome.as_str().unwrap().contains("Chrome/151"));
+    assert!(outcome.as_str().unwrap().contains("Chrome/149"));
 }
 
 #[test]

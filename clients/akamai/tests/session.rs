@@ -499,6 +499,6 @@ fn the_client_reports_what_it_is_carrying() {
 
     assert_eq!(info["target"], "akamai");
     assert_eq!(info["profile"], "builtin-desktop-chrome");
-    assert!(info["user_agent"].as_str().unwrap().contains("Chrome/151"));
+    assert!(info["user_agent"].as_str().unwrap().contains("Chrome/149"));
     assert_eq!(info["open"], false);
 }

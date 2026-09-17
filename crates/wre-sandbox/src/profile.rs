@@ -7,7 +7,22 @@ use wre_core::error::{Error, Result};
 
 static BUNDLED_SURFACE: &str = include_str!("../assets/desktop-chrome.json");
 
-const BUNDLED_CHROME: &str = "151";
+/// The Chrome major the bundled surface is retuned to at runtime.
+///
+/// MUST equal the TLS profile in `wre-net`'s `Fingerprint::default` — Akamai
+/// cross-checks the User-Agent header (from the TLS emulation) against
+/// `navigator.userAgent` (from this surface) and answers 502 BEFORE ANY SCRIPT
+/// RUNS when they disagree.
+///
+/// This constant is the authority, not the asset: `desktop_chrome()` calls
+/// `retune_chrome` which REWRITES every version field in the loaded JSON. Editing
+/// `assets/desktop-chrome.json` alone changes nothing at runtime — a fix made
+/// that way ships inert, which is how the 2026-09-17 outage nearly survived its
+/// own repair.
+///
+/// 151 was doubly wrong: no such Chrome has shipped, so `wreq-util` has no
+/// matching fingerprint and the mismatch was unfixable while that number stood.
+const BUNDLED_CHROME: &str = "149";
 
 static BUNDLED: std::sync::LazyLock<Profile> = std::sync::LazyLock::new(|| {
     serde_json::from_str(BUNDLED_SURFACE).expect("the bundled surface parses")
