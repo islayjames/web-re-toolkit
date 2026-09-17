@@ -80,10 +80,37 @@ enum Job {
     Stop,
 }
 
+/// A worker slot. `load` lives OUTSIDE the mutex so `pick_worker` and
+/// `metrics` read it without locking; `slot` holds the pieces that must be
+/// replaced atomically when a dead thread is revived.
 struct Worker {
-    jobs: Sender<Job>,
     load: Arc<AtomicUsize>,
+    slot: Mutex<WorkerSlot>,
+}
+
+struct WorkerSlot {
+    jobs: Sender<Job>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Spawn one worker thread and hand back the channel that feeds it.
+///
+/// Extracted from `Hub::new` so `Hub::send` can rebuild a slot in place. The
+/// `.expect("worker thread")` that used to stand here is gone: a spawn failure
+/// at revival time is an ordinary error the caller can retry, not a reason to
+/// take the process down.
+fn spawn_worker(
+    index: usize,
+    registry: Arc<Registry>,
+    services: Arc<Services>,
+    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    load: Arc<AtomicUsize>,
+) -> std::io::Result<WorkerSlot> {
+    let (jobs, inbox) = channel();
+    let handle = std::thread::Builder::new()
+        .name(format!("wred-worker-{index}"))
+        .spawn(move || run_worker(index, inbox, registry, services, sessions, load))?;
+    Ok(WorkerSlot { jobs, handle: Some(handle) })
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +122,7 @@ struct SessionEntry {
 
 pub struct Hub {
     registry: Arc<Registry>,
+    services: Arc<Services>,
     counters: Arc<Counters>,
     workers: Vec<Worker>,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
@@ -115,33 +143,21 @@ impl Hub {
         let mut workers = Vec::with_capacity(worker_count.max(1));
 
         for index in 0..worker_count.max(1) {
-            let (jobs, inbox) = channel();
             let load = Arc::new(AtomicUsize::new(0));
-
-            let thread_registry = Arc::clone(&registry);
-            let thread_services = Arc::clone(&services);
-            let thread_sessions = Arc::clone(&sessions);
-            let thread_load = Arc::clone(&load);
-
-            let handle = std::thread::Builder::new()
-                .name(format!("wred-worker-{index}"))
-                .spawn(move || {
-                    run_worker(
-                        index,
-                        inbox,
-                        thread_registry,
-                        thread_services,
-                        thread_sessions,
-                        thread_load,
-                    )
-                })
-                .expect("worker thread");
-
-            workers.push(Worker { jobs, load, handle: Some(handle) });
+            let slot = spawn_worker(
+                index,
+                Arc::clone(&registry),
+                Arc::clone(&services),
+                Arc::clone(&sessions),
+                Arc::clone(&load),
+            )
+            .expect("worker thread");
+            workers.push(Worker { load, slot: Mutex::new(slot) });
         }
 
         Arc::new(Self {
             registry,
+            services,
             counters,
             workers,
             sessions,
@@ -435,14 +451,15 @@ impl Hub {
         // degraded into 7 of 32 workers dead and ~40% of all jobs failing,
         // with no recovery short of a process restart.
         //
-        // Skip finished threads. If every worker is dead we still fall back to
-        // index 0 so the caller gets the existing "worker N is gone" error
-        // rather than a panic on an empty iterator.
+        // Skip finished threads. If every worker is dead we fall back to index
+        // 0, which `send` now REVIVES rather than reporting gone — so an
+        // all-dead hub heals on the next job instead of staying dead.
         self.workers
             .iter()
             .enumerate()
             .filter(|(_, worker)| {
-                worker.handle.as_ref().map_or(true, |handle| !handle.is_finished())
+                let slot = worker.slot.lock().unwrap_or_else(|e| e.into_inner());
+                slot.handle.as_ref().is_none_or(|handle| !handle.is_finished())
             })
             .min_by_key(|(_, worker)| worker.load.load(Ordering::Relaxed))
             .map(|(index, _)| index)
@@ -450,8 +467,56 @@ impl Hub {
     }
 
     fn send(&self, worker: usize, job: Job) -> ClientResult<()> {
-        self.workers[worker]
-            .jobs
+        // REVIVE THE WORKER. Do not merely report it dead.
+        //
+        // Worker threads were spawned once, in `Hub::new`, and nothing ever
+        // rebuilt one. A panic inside V8 therefore retired that worker for the
+        // lifetime of the process: `pick_worker` skipped it, and once every
+        // worker had panicked its all-dead fallback to index 0 made each
+        // subsequent job fail instantly with "worker 0 is gone".
+        //
+        // Measured in production 2026-09-17: 1338 of ~1900 dining calls in 75
+        // minutes returned exactly that, at durationMs 4 — the sidecar was up,
+        // listening and reporting 8 workers, every one of them a corpse. The
+        // failure is permanent without a process restart, which is why dining
+        // stayed down for 33 hours rather than degrading and recovering.
+        //
+        // A dead thread drops its Receiver, so `send` on the old channel would
+        // have errored anyway; the error was never the problem. The problem was
+        // that nothing replaced the thread. So: rebuild the slot, reset its
+        // load, and drop the session bindings that pointed into the dead
+        // isolate (the new thread has none of that state, and a session that
+        // silently resolves to a fresh isolate is worse than one that is gone).
+        let revived = {
+            let mut slot = self.workers[worker].slot.lock().unwrap_or_else(|e| e.into_inner());
+            let dead = slot.handle.as_ref().is_some_and(|handle| handle.is_finished());
+            if dead && !self.stopping() {
+                let fresh = spawn_worker(
+                    worker,
+                    Arc::clone(&self.registry),
+                    Arc::clone(&self.services),
+                    Arc::clone(&self.sessions),
+                    Arc::clone(&self.workers[worker].load),
+                )
+                .map_err(|err| {
+                    ClientError::internal(format!("worker {worker} died and could not be respawned: {err}"))
+                })?;
+                *slot = fresh;
+                self.workers[worker].load.store(0, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+
+        if revived {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.retain(|_, entry| entry.worker != worker);
+            tracing::warn!(worker, "worker thread had exited; respawned it");
+        }
+
+        let slot = self.workers[worker].slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.jobs
             .send(job)
             .map_err(|_| ClientError::internal(format!("worker {worker} is gone")))
     }
@@ -485,7 +550,8 @@ impl Hub {
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Relaxed);
         for worker in &self.workers {
-            let _ = worker.jobs.send(Job::Stop);
+            let slot = worker.slot.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = slot.jobs.send(Job::Stop);
         }
     }
 }
@@ -493,8 +559,9 @@ impl Hub {
 impl Drop for Hub {
     fn drop(&mut self) {
         for worker in &mut self.workers {
-            let _ = worker.jobs.send(Job::Stop);
-            if let Some(handle) = worker.handle.take() {
+            let mut slot = worker.slot.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = slot.jobs.send(Job::Stop);
+            if let Some(handle) = slot.handle.take() {
                 let _ = handle.join();
             }
         }
@@ -771,5 +838,132 @@ fn run_worker(
 
     for (_, mut live) in clients.drain() {
         let _ = live.client.close();
+    }
+}
+
+
+#[cfg(test)]
+mod dead_worker_tests {
+    use super::*;
+    use wre_client::MetricSink;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    /// A worker slot whose thread has exited.
+    ///
+    /// This is what a V8 panic leaves behind, and until 2026-09-17 it was
+    /// PERMANENT: threads were spawned once in `Hub::new` and nothing ever
+    /// rebuilt one. Production ran out of live workers entirely and every
+    /// subsequent job failed instantly with "worker 0 is gone" — 1338 of ~1900
+    /// dining calls in 75 minutes, at durationMs 4, against a sidecar that was
+    /// up and reporting 8 workers.
+    fn dead_slot() -> WorkerSlot {
+        let (jobs, rx) = channel::<Job>();
+        let handle = std::thread::spawn(move || {
+            let _rx = rx;
+        });
+        while !handle.is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        WorkerSlot { jobs, handle: Some(handle) }
+    }
+
+    fn hub_with(slot: WorkerSlot) -> Hub {
+        let dir = std::env::temp_dir().join(format!("wred-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let counters = Arc::new(Counters::default());
+        let services = Services::new(None, dir, Arc::clone(&counters) as Arc<dyn MetricSink>)
+            .expect("services");
+        Hub {
+            registry: Arc::new(Registry::default()),
+            services,
+            counters,
+            workers: vec![Worker { load: Arc::new(AtomicUsize::new(7)), slot: Mutex::new(slot) }],
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_session: AtomicU64::new(0),
+            started: Instant::now(),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    /// THE regression test for the 33-hour dining outage.
+    ///
+    /// Pre-fix this returns Err("worker 0 is gone") forever, for every job, for
+    /// the life of the process. Post-fix the slot is rebuilt and the job lands.
+    #[test]
+    fn send_respawns_a_worker_whose_thread_has_exited() {
+        let hub = hub_with(dead_slot());
+
+        hub.send(0, Job::Close { id: None, session: "s".into(), out: None })
+            .expect("a dead worker must be revived, not reported gone forever");
+
+        let slot = hub.workers[0].slot.lock().unwrap();
+        assert!(
+            !slot.handle.as_ref().unwrap().is_finished(),
+            "the slot must now hold a LIVE thread, not the corpse it started with"
+        );
+        assert_eq!(
+            hub.workers[0].load.load(Ordering::Relaxed),
+            0,
+            "a revived worker starts at zero load; a stale count would make \
+             pick_worker mis-rank it forever"
+        );
+    }
+
+    /// Sessions bound to the dead isolate must NOT survive the respawn.
+    ///
+    /// The fresh thread has none of that state, so a session that silently
+    /// resolves to a new isolate is worse than one that is gone — the caller
+    /// would get a confusing wrong-state answer instead of a clean retry.
+    #[test]
+    fn respawning_purges_the_sessions_bound_to_the_dead_worker() {
+        let hub = hub_with(dead_slot());
+        hub.sessions.lock().unwrap().insert(
+            "stale".into(),
+            SessionEntry { worker: 0, connection: 1, target: "t".into() },
+        );
+
+        hub.send(0, Job::Close { id: None, session: "s".into(), out: None }).expect("revived");
+
+        assert!(
+            hub.sessions.lock().unwrap().is_empty(),
+            "sessions pointing into the dead isolate must be dropped"
+        );
+    }
+
+    /// A shutting-down hub must NOT resurrect workers it just told to stop.
+    #[test]
+    fn a_stopping_hub_does_not_respawn() {
+        let hub = hub_with(dead_slot());
+        hub.stopping.store(true, Ordering::Relaxed);
+
+        let result = hub.send(0, Job::Close { id: None, session: "s".into(), out: None });
+
+        assert!(result.is_err(), "no revival during shutdown");
+    }
+
+    /// A worker that is ALIVE but BLOCKED — the case this fix does NOT cover.
+    ///
+    /// Recorded deliberately so nobody mistakes respawn for a cure-all. A thread
+    /// wedged inside V8 reports `is_finished() == false` and its channel is
+    /// connected, so the job is accepted and the caller waits out its own
+    /// timeout. Fixing that needs a per-job deadline inside the worker loop.
+    #[test]
+    fn a_blocked_but_living_worker_is_not_caught_by_the_respawn_check() {
+        let (jobs, rx) = channel::<Job>();
+        let blocked = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(30));
+            drop(rx);
+        });
+        let slot = WorkerSlot { jobs, handle: Some(blocked) };
+
+        assert!(
+            !slot.handle.as_ref().unwrap().is_finished(),
+            "a wedged worker reports as alive"
+        );
+        assert!(
+            slot.jobs.send(Job::Close { id: None, session: "s".into(), out: None }).is_ok(),
+            "and accepts jobs it will never process — the caller hangs"
+        );
     }
 }
