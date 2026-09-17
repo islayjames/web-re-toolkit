@@ -27,7 +27,21 @@ fn enabled() -> bool {
 impl Default for Fingerprint {
     fn default() -> Self {
         Self {
-            profile: Profile::Chrome140,
+            // MUST match the Chrome version the JS surface claims
+            // (crates/wre-sandbox/assets/desktop-chrome.json).
+            //
+            // They disagreed by eleven major versions: the TLS handshake and the
+            // User-Agent header said Chrome 140, while navigator.userAgent and
+            // userAgentData inside the sandbox said Chrome 151. Akamai's sensor
+            // reports what JS sees and the edge sees the header, so every request
+            // carried a self-contradiction — and Disney answered 502 BEFORE ANY
+            // SCRIPT RAN. Dining availability was down for hours on 2026-09-17
+            // behind that mismatch.
+            //
+            // 151 was doubly wrong: no such Chrome has ever shipped, so
+            // wreq-util cannot offer a matching fingerprint at all. 149 is the
+            // highest real profile available, and the surface is pinned to it.
+            profile: Profile::Chrome149,
             platform: Platform::MacOS,
             http2: true,
             headers: true,
@@ -385,8 +399,14 @@ mod tests {
 
     #[test]
     fn round_trips_display_form() {
+        // The literal tracks the default profile, which is pinned to whatever
+        // Chrome the JS surface claims — see the comment on `Fingerprint::default`
+        // and the coherence test in tests/fingerprint_ua_coherence.rs. Changing
+        // one without the other is the 502 this crate was debugged for, so this
+        // assertion is deliberately literal rather than derived: it should fail
+        // loudly and be updated alongside the surface asset.
         let fingerprint = Fingerprint::default();
-        assert_eq!(fingerprint.to_string(), "chrome_140:macos");
+        assert_eq!(fingerprint.to_string(), "chrome_149:macos");
         assert_eq!(fingerprint.to_string().parse::<Fingerprint>().unwrap(), fingerprint);
     }
 }
